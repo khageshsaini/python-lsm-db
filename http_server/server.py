@@ -1,177 +1,157 @@
 import asyncio
-import time
-from typing import Dict, Callable, Tuple, Optional, List
-from urllib.parse import parse_qs, urlparse
 import json
+import logging
+import time
+from collections.abc import Callable
+from urllib.parse import parse_qs, urlparse
+
 from .request import Request
 from .response import Response
-import logging
 
 logger = logging.getLogger()
 
+
 class HTTPServer:
-    def __init__(self, host: str = '0.0.0.0', port: int = 8080):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8080):
         self.host = host
         self.port = port
-        self.routes: Dict[Tuple[str, str], Callable] = {}
-        
-    def route(self, path: str, methods: Optional[List] = None):
+        self.routes: dict[tuple[str, str], Callable] = {}
+
+    def route(self, path: str, methods: list | None = None):
         """Decorator for registering route handlers"""
         if methods is None:
-            methods = ['GET']
-            
+            methods = ["GET"]
+
         def decorator(handler):
             for method in methods:
                 self.routes[(method.upper(), path)] = handler
             return handler
+
         return decorator
-        
-    async def parse_request(self, reader: asyncio.StreamReader) -> Optional[Request]:
+
+    async def parse_request(self, reader: asyncio.StreamReader) -> Request | None:
         """Parse HTTP request with timeout and size limits"""
         try:
             # Read request line with timeout
-            request_line = await asyncio.wait_for(
-                reader.readline(), 
-                timeout=5.0
-            )
-            
+            request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+
             if not request_line:
                 return None
-                
-            request_line = request_line.decode('utf-8').strip()
-            method, full_path, version = request_line.split(' ', 2)
-            
+
+            request_line = request_line.decode("utf-8").strip()
+            method, full_path, version = request_line.split(" ", 2)
+
             # Parse URL and query parameters
             parsed_url = urlparse(full_path)
             path = parsed_url.path
             query_params = parse_qs(parsed_url.query)
-            
+
             # Parse headers
             headers = {}
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=5.0)
-                if line == b'\r\n' or line == b'\n':
+                if line == b"\r\n" or line == b"\n":
                     break
-                    
-                header_line = line.decode('utf-8').strip()
-                if ':' in header_line:
-                    key, value = header_line.split(':', 1)
+
+                header_line = line.decode("utf-8").strip()
+                if ":" in header_line:
+                    key, value = header_line.split(":", 1)
                     headers[key.strip().lower()] = value.strip()
-            
+
             # Read body if present
-            body = b''
-            content_length = int(headers.get('content-length', 0))
-            
-            if content_length > 0:
-                # Limit body size to 10MB
+            body = b""
+            try:
+                content_length = int(headers.get("content-length", 0))
+                if content_length < 0:
+                    return None  # Invalid negative content-length
                 if content_length > 10 * 1024 * 1024:
                     raise ValueError("Request body too large")
-                    
-                body = await asyncio.wait_for(
-                    reader.readexactly(content_length),
-                    timeout=30.0
-                )
-            
+            except (ValueError, OverflowError):
+                return None  # Malformed content-length header
+
+            if content_length > 0:
+                body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30.0)
+
             return Request(
                 method=method.upper(),
                 path=path,
                 headers=headers,
                 query_params=query_params,
                 body=body,
-                version=version
+                version=version,
             )
-            
+
         except asyncio.TimeoutError:
             return None
         except Exception as e:
             logger.error(f"Error parsing request: {e}")
             return None
-    
+
     def build_response(self, response: Response) -> bytes:
         """Build HTTP response bytes"""
         status_messages = {
-            200: 'OK',
-            201: 'Created',
-            204: 'No Content',
-            400: 'Bad Request',
-            404: 'Not Found',
-            405: 'Method Not Allowed',
-            500: 'Internal Server Error',
+            200: "OK",
+            201: "Created",
+            204: "No Content",
+            400: "Bad Request",
+            404: "Not Found",
+            405: "Method Not Allowed",
+            500: "Internal Server Error",
         }
-        
-        status_text = status_messages.get(response.status, 'Unknown')
-        
+
+        status_text = status_messages.get(response.status, "Unknown")
+
         # Set default headers
-        if 'content-type' not in response.headers:
-            response.headers['content-type'] = 'text/plain'
-        
-        response.headers['content-length'] = str(len(response.body))
-        response.headers['connection'] = 'keep-alive'
-        response.headers['server'] = 'DbEngineHttp/1.0'
-        
+        if "content-type" not in response.headers:
+            response.headers["content-type"] = "text/plain"
+
+        response.headers["content-length"] = str(len(response.body))
+        response.headers["connection"] = "keep-alive"
+        response.headers["server"] = "DbEngineHttp/1.0"
+
         # Build response
         response_line = f"HTTP/1.1 {response.status} {status_text}\r\n"
-        header_lines = ''.join(
-            f"{key}: {value}\r\n" 
-            for key, value in response.headers.items()
-        )
-        
-        response_bytes = (
-            response_line.encode() + 
-            header_lines.encode() + 
-            b'\r\n' + 
-            response.body
-        )
-        
+        header_lines = "".join(f"{key}: {value}\r\n" for key, value in response.headers.items())
+
+        response_bytes = response_line.encode() + header_lines.encode() + b"\r\n" + response.body
+
         return response_bytes
-    
+
     async def handle_request(self, request: Request) -> Response:
         """Route request to appropriate handler"""
         # Find matching route
         route_key = (request.method, request.path)
         handler = self.routes.get(route_key)
-        
+
         if handler is None:
-            return Response(
-                status=404,
-                body=b'Route Not Found'
-            )
-        
+            return Response(status=404, body=b"Route Not Found")
+
         try:
             # Call handler
             result = await handler(request)
-            
+
             if isinstance(result, Response):
                 return result
             elif isinstance(result, dict):
                 return Response(
                     status=200,
-                    headers={'content-type': 'application/json'},
-                    body=json.dumps(result).encode()
+                    headers={"content-type": "application/json"},
+                    body=json.dumps(result).encode(),
                 )
             elif isinstance(result, str):
-                return Response(
-                    status=200,
-                    body=result.encode()
-                )
+                return Response(status=200, body=result.encode())
             elif isinstance(result, bytes):
-                return Response(
-                    status=200,
-                    body=result
-                )
-            
+                return Response(status=200, body=result)
+
             raise TypeError("Response cannot be casted to appropriate HTTP response format")
         except Exception as e:
             logger.error(f"Handler error: {e}")
-            return Response(
-                status=500,
-                body=b'Internal Server Error'
-            )
-    
+            return Response(status=500, body=b"Internal Server Error")
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a single client connection with keep-alive"""
-        peer = writer.get_extra_info('peername')
-        
+        peer = writer.get_extra_info("peername")
+
         try:
             # Keep-alive loop
             while True:
@@ -194,12 +174,12 @@ class HTTPServer:
                 logger.debug(
                     f"<-- {response.status} - {len(response.body)} bytes - {elapsed_ms:.2f}ms"
                 )
-                
+
                 # Check if client wants to close connection
-                connection_header = request.headers.get('connection', '').lower()
-                if connection_header == 'close':
+                connection_header = request.headers.get("connection", "").lower()
+                if connection_header == "close":
                     break
-                    
+
         except ConnectionResetError:
             pass
         except Exception as e:
@@ -208,20 +188,16 @@ class HTTPServer:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except:
-                pass
-    
+            except Exception as e:
+                logger.debug(f"Error closing connection: {e}")
+
     async def start(self):
         """Start the HTTP server"""
-        server = await asyncio.start_server(
-            self.handle_client,
-            self.host,
-            self.port
-        )
-        
+        server = await asyncio.start_server(self.handle_client, self.host, self.port)
+
         addr = server.sockets[0].getsockname()
-        logger.info(f'DB Engine HTTP Server running on http://{addr[0]}:{addr[1]}')
-        
+        logger.info(f"DB Engine HTTP Server running on http://{addr[0]}:{addr[1]}")
+
         try:
             async with server:
                 await server.serve_forever()
@@ -229,7 +205,7 @@ class HTTPServer:
             logger.info("Server shutdown requested")
         finally:
             await self.shutdown(server)
-    
+
     async def shutdown(self, server):
         """Gracefully shutdown the server"""
         logger.info("Shutting down server...")

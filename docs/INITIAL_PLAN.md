@@ -108,6 +108,7 @@ WALEntry: # Dataclass
     + seq: int
 
     - __bytes__()
+    - from_bytes(bytes) -> WALEntry
 
 WAL:
     + id: str
