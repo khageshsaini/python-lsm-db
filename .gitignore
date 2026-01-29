@@ -10,3 +10,4 @@ docs/CODE*
 .ruff*
 **/__pycache__/
 *.py[cod]
+*.egg-info/

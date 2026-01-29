@@ -290,7 +290,10 @@ class SSTable(RangeIterable):
 
         index: dict[str, int] = {}
 
-        with open(file_path, "wb") as f:
+        # Write to temporary file first for atomic operation
+        temp_path = file_path + ".tmp"
+
+        with open(temp_path, "wb") as f:
             # Write entries
             for key, value in entries:
                 offset = f.tell()
@@ -321,6 +324,9 @@ class SSTable(RangeIterable):
 
             # Write footer (index offset)
             f.write(index_offset.to_bytes(8, "big"))
+
+        # Atomically rename temp file to final path
+        os.rename(temp_path, file_path)
 
         sstable = SSTable(id, file_path)
         sstable.open()
