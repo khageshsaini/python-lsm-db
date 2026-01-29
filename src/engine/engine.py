@@ -606,15 +606,21 @@ class Engine:
                     # Update state atomically (under lock)
                     async with self._sstables_lock:
                         # Build new SSTable list:
-                        # - New compacted SSTable at front (newest position)
-                        # - Keep any SSTables added during compaction (not in our snapshot)
-                        new_sstables = [new_sstable]
+                        # - Keep any SSTables added during compaction (they're newer)
+                        # - Add the compacted SSTable in correct position based on ID
+                        # - Remove the old SSTables that were compacted
 
+                        # Collect all SSTables: new ones + compacted one
+                        all_sstables = [new_sstable]
                         for sst in self._sstables:
                             if sst not in sstables_to_compact:
-                                new_sstables.append(sst)
+                                all_sstables.append(sst)
 
-                        self._sstables = new_sstables
+                        # Sort by ID (descending) to maintain newest-first order
+                        # Higher ID = newer SSTable
+                        all_sstables.sort(key=lambda sst: int(sst.id), reverse=True)
+
+                        self._sstables = all_sstables
 
                     # Close old SSTables and delete files (outside lock)
                     for old_sst in old_sstables:
