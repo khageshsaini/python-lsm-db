@@ -55,10 +55,8 @@ class MemToSSTableConverter:
         file_path = os.path.join(sstables_dir, f"{ss_id}.sst")
 
         # Create SSTable from MemTable entries
+        # Note: WAL cleanup is handled by the engine after SSTable is registered
         sstable = SSTable.create(id=ss_id, file_path=file_path, entries=self._get_entries())
-
-        # Clean up WAL after successful flush
-        self._wal.destroy()
 
         return sstable
 
