@@ -34,6 +34,21 @@ Runs a subset of tests for faster feedback:
 **Operations**: ~50,000 total
 **Disk Usage**: ~15 MB
 
+### Run Compaction Tests
+```bash
+python test_performance.py compaction
+```
+
+Tests SSTable compaction performance improvements:
+- Read performance before/after compaction
+- Range query performance before/after compaction
+- Tombstone cleanup and space savings
+- Large-scale compaction tests
+
+**Duration**: ~30-40 seconds
+**Operations**: ~60,000 reads + writes
+**Key Benefits Measured**: Throughput improvement, latency reduction, space savings
+
 ## What Gets Tested
 
 ### 1. Write Throughput
@@ -209,6 +224,129 @@ Based on actual test runs on modern hardware (MacBook/desktop):
 | Range Query (500 keys) | 30-35 queries/sec | 20.811 ms |
 | Mixed (70% reads) | 26K-27K ops/sec | Read: 0.040 ms / Write: 0.009 ms |
 | Mixed (90% reads) | 28K-29K ops/sec | Read: 0.037 ms / Write: 0.009 ms |
+
+## Compaction Performance Tests
+
+The compaction tests measure the benefits of SSTable compaction by comparing performance before and after merging multiple SSTables into one.
+
+### What Compaction Tests Measure
+
+1. **Read Performance Improvement**
+   - Creates multiple overlapping SSTables
+   - Measures read latency with N SSTables
+   - Runs compaction to merge into 1 SSTable
+   - Measures read latency after compaction
+
+2. **Range Query Improvement**
+   - Tests range queries across multiple SSTables
+   - Compares k-way merge overhead (N sources vs 1 source)
+
+3. **Space Efficiency**
+   - Measures disk usage before/after compaction
+   - Tests tombstone removal
+   - Tests duplicate key elimination
+
+### Actual Compaction Test Results
+
+Based on actual test runs:
+
+| Test | Before Compaction | After Compaction | Improvement |
+|------|-------------------|------------------|-------------|
+| **Read Throughput** | 6,195 ops/sec | 6,155 ops/sec | ~0% (caching effects) |
+| **Read Latency (p50)** | 0.149 ms | 0.148 ms | +0.4% |
+| **Range Query Throughput** | 92 queries/sec | 561 queries/sec | **+515%** 🚀 |
+| **Range Query Latency (p50)** | 10.75 ms | 1.73 ms | **-84%** 🚀 |
+| **Disk Space (100 SSTables)** | 5,763 KB | 576 KB | **-90%** 💾 |
+| **Disk Space (Tombstones)** | 1,170 KB | 471 KB | **-60%** 💾 |
+| **SSTable Count** | 100 files | 1 file | **-99%** |
+
+### Key Findings
+
+✅ **Massive Range Query Improvements**
+- Range queries become 5-6x faster after compaction
+- Eliminates k-way merge overhead at read time
+- Single SSTable iteration vs merging N iterators
+
+✅ **Significant Space Savings**
+- 60-90% disk space reduction depending on data patterns
+- Tombstones completely removed during compaction
+- Duplicate keys deduplicated (newest value kept)
+
+✅ **Read Latency Stable**
+- Point reads show minimal difference (heavily cached)
+- Improvement becomes more pronounced with cold cache
+- Fewer file handles to manage
+
+### Sample Compaction Test Output
+
+```
+############################################################
+# TEST 2: Range Query Performance Before/After Compaction
+############################################################
+
+============================================================
+Compaction Range Query Performance Test
+  SSTables: 5, Keys per SSTable: 1000
+  Queries: 1000, Range size: 50
+============================================================
+
+  Phase 1: Creating 5 SSTables...
+    Created SSTable 1/5
+    Created SSTable 2/5
+    Created SSTable 3/5
+    Created SSTable 4/5
+    Created SSTable 5/5
+
+  Before compaction: 20 SSTables
+
+  Phase 2: Range queries before compaction...
+    Queries: 1000, Elapsed: 10.91s
+    Throughput: 91.66 queries/sec
+    Latency p50/p95/p99: 10.752/12.300/13.639 ms
+
+  Phase 3: Running compaction...
+
+  After compaction: 1 SSTables
+
+  Phase 4: Range queries after compaction...
+    Queries: 1000, Elapsed: 1.78s
+    Throughput: 560.73 queries/sec
+    Latency p50/p95/p99: 1.729/2.109/2.484 ms
+
+  === IMPROVEMENT SUMMARY ===
+    SSTable reduction: 20 -> 1
+    Throughput improvement: +511.8%
+    Latency improvement (p50): +83.9%
+```
+
+### Compaction Test Summary Output
+
+```
+############################################################
+# COMPACTION TEST SUMMARY
+############################################################
+
+1. Compaction Read Performance
+   Throughput improvement: +2.3%
+   Latency improvement (p50): +1.5%
+   Space savings: 80.0%
+   Compaction time: 0.18s
+
+2. Compaction Range Query Performance
+   Throughput improvement: +515.5%
+   Latency improvement (p50): +84.0%
+   Compaction time: 0.18s
+
+3. Tombstone Cleanup
+   Space savings: 59.7%
+   Compaction time: 0.29s
+
+4. Compaction Read Performance (Large Scale: 100 SSTables)
+   Throughput improvement: -0.6%
+   Latency improvement (p50): +0.4%
+   Space savings: 90.0%
+   Compaction time: 0.69s
+```
 
 ## Troubleshooting
 
