@@ -325,8 +325,18 @@ class SSTable(RangeIterable):
             # Write footer (index offset)
             f.write(index_offset.to_bytes(8, "big"))
 
+            # Ensure data is flushed to disk before rename for durability
+            f.flush()
+            os.fsync(f.fileno())
+
         # Atomically rename temp file to final path
-        os.rename(temp_path, file_path)
+        try:
+            os.rename(temp_path, file_path)
+        except Exception:
+            # Clean up temp file if rename fails
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
 
         sstable = SSTable(id, file_path)
         sstable.open()

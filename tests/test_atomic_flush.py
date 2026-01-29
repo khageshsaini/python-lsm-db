@@ -74,9 +74,9 @@ class TestAtomicSSTableFlush:
             sst_path = os.path.join(tmpdir, "test.sst")
             temp_path = sst_path + ".tmp"
 
-            # Create a stale temp file
-            with open(temp_path, "w") as f:
-                f.write("stale data")
+            # Create a stale temp file (binary mode for realistic simulation)
+            with open(temp_path, "wb") as f:
+                f.write(b"stale data")
 
             # Create entries
             entries = [
