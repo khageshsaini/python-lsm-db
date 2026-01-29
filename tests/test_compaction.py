@@ -469,6 +469,73 @@ class TestCompactionConcurrency:
             finally:
                 await engine.close()
 
+    async def test_sstable_ordering_after_compaction_with_concurrent_flush(self):
+        """
+        Test that SSTables are correctly ordered by ID after compaction
+        when new SSTables are added during compaction.
+
+        This test validates the fix for the bug where compacted SSTables
+        were always placed at position 0, even when newer SSTables were
+        flushed during compaction.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            engine = await Engine.create(
+                storage_dir=tmpdir,
+                memtable_threshold=100,
+                compaction_threshold=2,
+                compaction_interval_s=0.5,
+            )
+
+            try:
+                # Write data that will create SSTable with ID 0
+                await engine.put("key1", "old_value1")
+                await engine.put("key2", "old_value2")
+                await engine.put("flush1", "x" * 100)  # Trigger flush
+                await asyncio.sleep(0.3)
+
+                # Write data that will create SSTable with ID 1
+                await engine.put("key3", "old_value3")
+                await engine.put("flush2", "x" * 100)  # Trigger flush
+                await asyncio.sleep(0.3)
+
+                # Wait for compaction to start (it will compact SSTables 0 and 1)
+                await asyncio.sleep(0.6)
+
+                # DURING compaction, add new data to create SSTable with ID 3
+                # (ID 2 will be the compacted SSTable)
+                await engine.put("key1", "new_value1")  # Update key1 with newer value
+                await engine.put("flush3", "x" * 100)  # Trigger flush
+                await asyncio.sleep(0.3)
+
+                # Wait for everything to settle
+                await asyncio.sleep(1.5)
+
+                # The critical test: newer value should win
+                # If SSTables are ordered correctly (ID 3 before ID 2),
+                # key1 should have "new_value1"
+                # If ordering is wrong (ID 2 before ID 3), key1 would have "old_value1"
+                result = await engine.get("key1")
+                assert result == "new_value1", (
+                    f"SSTable ordering is incorrect! Got '{result}', expected 'new_value1'. "
+                    f"This means the compacted SSTable (ID 2) is incorrectly prioritized "
+                    f"over the newer flushed SSTable (ID 3)."
+                )
+
+                # Verify SSTable list is sorted by ID (descending)
+                async with engine._sstables_lock:
+                    sstable_ids = [int(sst.id) for sst in engine._sstables]
+                    # Should be sorted highest to lowest
+                    assert sstable_ids == sorted(sstable_ids, reverse=True), (
+                        f"SSTables not sorted by ID! Got: {sstable_ids}"
+                    )
+
+                # Verify all other data is still accessible
+                assert await engine.get("key2") == "old_value2"
+                assert await engine.get("key3") == "old_value3"
+
+            finally:
+                await engine.close()
+
 
 class TestCompactionRecovery:
     """Recovery tests for compaction."""
