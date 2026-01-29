@@ -498,15 +498,27 @@ class PerformanceTest:
         # We'll do this by temporarily reducing the interval and waiting
         loop = asyncio.get_running_loop()
 
-        # Get snapshot under lock
-        async with self.engine._sstables_lock:
-            if self.engine._compaction_in_progress:
-                print("  Compaction already in progress, waiting...")
-            else:
-                self.engine._compaction_in_progress = True
-                sstables_to_compact = list(self.engine._sstables)
-                new_ss_id = str(self.engine._ss_id_seq)
-                self.engine._ss_id_seq += 1
+        # Check if compaction is already in progress and wait if needed
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            async with self.engine._sstables_lock:
+                if self.engine._compaction_in_progress:
+                    # Compaction is running, wait a bit
+                    pass
+                else:
+                    # Compaction not running, we can start one
+                    self.engine._compaction_in_progress = True
+                    sstables_to_compact = list(self.engine._sstables)
+                    new_ss_id = str(self.engine._ss_id_seq)
+                    self.engine._ss_id_seq += 1
+                    break
+
+            # Wait before checking again
+            await asyncio.sleep(0.1)
+        else:
+            # Timed out waiting for existing compaction
+            print(f"  Timed out waiting for compaction to become available")
+            return False
 
         if not sstables_to_compact:
             self.engine._compaction_in_progress = False

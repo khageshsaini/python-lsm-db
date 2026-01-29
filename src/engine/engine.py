@@ -3,6 +3,7 @@ Engine - Main database engine API.
 """
 
 import asyncio
+import logging
 import os
 import threading
 from pathlib import Path
@@ -447,8 +448,6 @@ class Engine:
 
     async def _flush_worker(self) -> None:
         """Background worker that processes flush queue in thread pool."""
-        import logging
-
         if self._flush_queue is None:
             return
 
@@ -561,8 +560,6 @@ class Engine:
         - Only one compaction at a time (checked via _compaction_in_progress flag)
         - Lock held only for state reads/updates, not during I/O
         """
-        import logging
-
         loop = asyncio.get_running_loop()
 
         while True:
@@ -645,9 +642,7 @@ class Engine:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                import logging
-
-                logging.error(f"Compaction worker error: {e}")
+                logging.exception(f"Compaction worker error: {e}")
                 self._compaction_in_progress = False
 
     def _compact_sstables_sync(
