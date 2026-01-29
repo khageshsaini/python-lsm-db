@@ -102,18 +102,26 @@ class EngineInitializer:
 
     def _cleanup_temp_files(self) -> None:
         """
-        Remove orphaned .tmp files from interrupted SSTable flushes.
+        Remove orphaned .tmp files from interrupted operations.
 
-        These files indicate a crash during SSTable creation. The data
-        is safe in the WAL and will be re-flushed.
+        Handles temp files from:
+        - Interrupted SSTable flushes (pattern: <id>.sst.tmp)
+        - Interrupted compactions (pattern: <id>.sst.tmp)
+
+        For flushes, the data is safe in the WAL and will be re-flushed.
+        For compactions, the original SSTables are still intact.
         """
         if not os.path.exists(self._sstable_dir):
             return
 
         for filename in os.listdir(self._sstable_dir):
+            # Matches both "<id>.sst.tmp" (compaction/flush) and "<id>.tmp" (legacy)
             if filename.endswith(".tmp"):
                 tmp_path = os.path.join(self._sstable_dir, filename)
-                os.remove(tmp_path)
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass  # Best effort cleanup
 
     def recover(self) -> tuple[list[tuple[MemTable, WAL]], list[SSTable], int]:
         """

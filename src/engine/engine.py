@@ -33,6 +33,7 @@ class Engine:
     - Writes go to MemTable (in-memory) + WAL (durability)
     - When MemTable exceeds threshold, it's flushed to SSTable
     - Reads check MemTable first, then SSTables (newest to oldest)
+    - Background compaction merges SSTables periodically
     """
 
     # Default threshold for MemTable rotation (128MB)
@@ -41,11 +42,18 @@ class Engine:
     # Default FSYNC Interval for WAL
     DEFAULT_FSYNC_INTERVAL_MS = 1000
 
+    # Default compaction settings
+    DEFAULT_COMPACTION_THRESHOLD = 2  # Compact when >= 2 SSTables
+    DEFAULT_COMPACTION_INTERVAL_S = 10.0  # Check every 10 seconds
+
     def __init__(
         self,
         storage_dir: str,
         memtable_threshold: int = DEFAULT_MEMTABLE_THRESHOLD,
-        fsync_interval_ms: int = 0
+        fsync_interval_ms: int = 0,
+        compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
+        compaction_interval_s: float = DEFAULT_COMPACTION_INTERVAL_S,
+        compaction_enabled: bool = True,
     ) -> None:
         """
         Initialize the database engine.
@@ -55,6 +63,9 @@ class Engine:
             memtable_threshold: Size threshold for MemTable rotation in bytes.
             fsync_interval_ms: Milliseconds between WAL fsyncs (default: 0 = always fsync).
                               Maximum: 10000 (10 seconds).
+            compaction_threshold: Minimum number of SSTables to trigger compaction.
+            compaction_interval_s: Seconds between compaction checks.
+            compaction_enabled: Whether to enable background compaction.
         """
         # Validate memtable_threshold
         if memtable_threshold <= 0:
@@ -74,6 +85,16 @@ class Engine:
         if fsync_interval_ms > 10000:
             raise ValueError(
                 f"fsync_interval_ms cannot exceed 10000ms (10 seconds), got {fsync_interval_ms}"
+            )
+
+        # Validate compaction parameters
+        if compaction_threshold < 2:
+            raise ValueError(
+                f"compaction_threshold must be >= 2, got {compaction_threshold}"
+            )
+        if compaction_interval_s <= 0:
+            raise ValueError(
+                f"compaction_interval_s must be positive, got {compaction_interval_s}"
             )
 
         # Validate storage_dir
@@ -97,6 +118,9 @@ class Engine:
         self._storage_dir = storage_dir
         self._memtable_threshold = memtable_threshold
         self._fsync_interval_ms = fsync_interval_ms
+        self._compaction_threshold = compaction_threshold
+        self._compaction_interval_s = compaction_interval_s
+        self._compaction_enabled = compaction_enabled
 
         # Current active MemTable and WAL (always valid after __init__)
         self._memtable: MemTable
@@ -117,6 +141,10 @@ class Engine:
         # Background flush task (lazy initialized in async context)
         self._flush_queue: asyncio.Queue[tuple[MemTable, WAL, str]] | None = None
         self._flush_task: asyncio.Task | None = None
+
+        # Background compaction task
+        self._compaction_task: asyncio.Task | None = None
+        self._compaction_in_progress: bool = False
 
         # Write lock for thread-safe put operations (lazy initialized in async context)
         self._write_lock: asyncio.Lock | None = None
@@ -155,7 +183,10 @@ class Engine:
         cls,
         storage_dir: str,
         memtable_threshold: int = DEFAULT_MEMTABLE_THRESHOLD,
-        fsync_interval_ms: int = DEFAULT_FSYNC_INTERVAL_MS
+        fsync_interval_ms: int = DEFAULT_FSYNC_INTERVAL_MS,
+        compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
+        compaction_interval_s: float = DEFAULT_COMPACTION_INTERVAL_S,
+        compaction_enabled: bool = True,
     ) -> "Engine":
         """
         Async factory method to create and initialize engine.
@@ -165,11 +196,21 @@ class Engine:
             memtable_threshold: Size threshold for MemTable rotation in bytes.
             fsync_interval_ms: Milliseconds between WAL fsyncs (default: 0 = always fsync).
                               Maximum: 10000 (10 seconds).
+            compaction_threshold: Minimum number of SSTables to trigger compaction.
+            compaction_interval_s: Seconds between compaction checks.
+            compaction_enabled: Whether to enable background compaction.
 
         Returns:
-            Initialized Engine instance with background flush worker running.
+            Initialized Engine instance with background workers running.
         """
-        engine = cls(storage_dir, memtable_threshold, fsync_interval_ms)
+        engine = cls(
+            storage_dir,
+            memtable_threshold,
+            fsync_interval_ms,
+            compaction_threshold,
+            compaction_interval_s,
+            compaction_enabled,
+        )
 
         # Initialize asyncio primitives upfront (avoids race condition)
         engine._flush_queue = asyncio.Queue()
@@ -182,6 +223,7 @@ class Engine:
             await engine._schedule_flush(memtable, wal)
 
         await engine._start_flush_worker()
+        await engine._start_compaction_worker()
         return engine
 
     def _initialize(self) -> None:
@@ -503,6 +545,126 @@ class Engine:
         sstable = converter.initiate(ss_id)
         return sstable  # Don't modify shared state here!
 
+    async def _start_compaction_worker(self) -> None:
+        """Start the background compaction worker if enabled and not already running."""
+        if not self._compaction_enabled:
+            return
+        if self._compaction_task is None or self._compaction_task.done():
+            self._compaction_task = asyncio.create_task(self._compaction_worker())
+
+    async def _compaction_worker(self) -> None:
+        """
+        Background worker that periodically checks for and performs compaction.
+
+        Design:
+        - Periodic check (not queue-based) since compaction is opportunistic
+        - Only one compaction at a time (checked via _compaction_in_progress flag)
+        - Lock held only for state reads/updates, not during I/O
+        """
+        import logging
+
+        loop = asyncio.get_running_loop()
+
+        while True:
+            try:
+                # Wait for next check interval
+                await asyncio.sleep(self._compaction_interval_s)
+
+                # Check if compaction needed (under lock)
+                async with self._sstables_lock:
+                    sstable_count = len(self._sstables)
+                    if sstable_count < self._compaction_threshold:
+                        continue
+
+                    # Check if already compacting (single async task, no separate lock needed)
+                    if self._compaction_in_progress:
+                        continue
+                    self._compaction_in_progress = True
+
+                    # Snapshot SSTables to compact (all current ones)
+                    # Ordered newest to oldest (as maintained by engine)
+                    sstables_to_compact = list(self._sstables)
+
+                    # Allocate new SSTable ID
+                    new_ss_id = str(self._ss_id_seq)
+                    self._ss_id_seq += 1
+
+                try:
+                    logging.info(
+                        f"Starting compaction of {len(sstables_to_compact)} SSTables "
+                        f"into SSTable {new_ss_id}"
+                    )
+
+                    # Run compaction in thread pool (I/O intensive)
+                    new_sstable, old_sstables = await loop.run_in_executor(
+                        None,
+                        self._compact_sstables_sync,
+                        sstables_to_compact,
+                        new_ss_id,
+                    )
+
+                    # Update state atomically (under lock)
+                    async with self._sstables_lock:
+                        # Build new SSTable list:
+                        # - New compacted SSTable at front (newest position)
+                        # - Keep any SSTables added during compaction (not in our snapshot)
+                        new_sstables = [new_sstable]
+
+                        for sst in self._sstables:
+                            if sst not in sstables_to_compact:
+                                new_sstables.append(sst)
+
+                        self._sstables = new_sstables
+
+                    # Close old SSTables and delete files (outside lock)
+                    for old_sst in old_sstables:
+                        old_sst.close()
+
+                    for old_sst in old_sstables:
+                        try:
+                            os.remove(old_sst.file_path)
+                        except OSError as e:
+                            logging.warning(
+                                f"Failed to delete old SSTable {old_sst.file_path}: {e}"
+                            )
+
+                    logging.info(
+                        f"Compaction complete: merged {len(sstables_to_compact)} SSTables "
+                        f"into {new_ss_id}"
+                    )
+
+                finally:
+                    self._compaction_in_progress = False
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                import logging
+
+                logging.error(f"Compaction worker error: {e}")
+                self._compaction_in_progress = False
+
+    def _compact_sstables_sync(
+        self, sstables: list[SSTable], new_ss_id: str
+    ) -> tuple[SSTable, list[SSTable]]:
+        """
+        Perform compaction synchronously (runs in thread pool).
+
+        Args:
+            sstables: SSTables to compact (ordered newest to oldest).
+            new_ss_id: ID for new compacted SSTable.
+
+        Returns:
+            Tuple of (new_sstable, list_of_old_sstables).
+        """
+        from src.engine.compactor import SSTableCompactor
+
+        compactor = SSTableCompactor(sstables, self._storage_dir)
+        new_sstable = compactor.compact(new_ss_id)
+        old_sstables = compactor.get_input_sstables()
+
+        return new_sstable, old_sstables
+
     async def close(self) -> None:
         """Async close the engine, flushing any pending data."""
         # Flush active memtable and add to queue
@@ -513,11 +675,19 @@ class Engine:
         if self._flush_queue:
             await self._flush_queue.join()
 
-        # Now cancel worker
+        # Cancel flush worker
         if self._flush_task:
             self._flush_task.cancel()
             try:
                 await self._flush_task
+            except asyncio.CancelledError:
+                pass
+
+        # Cancel compaction worker
+        if self._compaction_task:
+            self._compaction_task.cancel()
+            try:
+                await self._compaction_task
             except asyncio.CancelledError:
                 pass
 
@@ -564,6 +734,7 @@ class Engine:
     async def __aenter__(self) -> "Engine":
         await self._ensure_async_initialized()
         await self._start_flush_worker()
+        await self._start_compaction_worker()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
