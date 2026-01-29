@@ -277,16 +277,18 @@ class Engine:
         if value is not None:
             return None if value.is_tombstone() else value.data
 
+        # Snapshot both lists under lock for consistency
+        async with self._sstables_lock:
+            immutable_snapshot = list(self._immutable_memtables)
+            sstables_snapshot = list(self._sstables)
+
         # Check immutable MemTables (in-memory, fast)
-        for memtable, _ in self._immutable_memtables:
+        for memtable, _ in immutable_snapshot:
             value = memtable.get(key)
             if value is not None:
                 return None if value.is_tombstone() else value.data
 
-        # Check SSTables using native async I/O (snapshot for thread safety)
-        async with self._sstables_lock:
-            sstables_snapshot = list(self._sstables)
-
+        # Check SSTables using native async I/O
         for sstable in sstables_snapshot:
             value = await sstable.get(key)
             if value is not None:
@@ -315,15 +317,16 @@ class Engine:
         # 1. Active MemTable (most recent, in-memory)
         sources.append(iter(self._memtable.get_range(k1, k2)))
 
-        # 2. Immutable MemTables (in order, in-memory)
-        for memtable, _ in self._immutable_memtables:
-            sources.append(iter(memtable.get_range(k1, k2)))
-
-        # 3. SSTables - uses native async I/O (snapshot for thread safety)
+        # Snapshot both lists under lock for consistency
         async with self._sstables_lock:
+            immutable_snapshot = list(self._immutable_memtables)
             sstables_snapshot = list(self._sstables)
 
-        # Fetch all SSTable ranges (already sorted per SSTable)
+        # 2. Immutable MemTables (in order, in-memory)
+        for memtable, _ in immutable_snapshot:
+            sources.append(iter(memtable.get_range(k1, k2)))
+
+        # 3. Fetch all SSTable ranges (already sorted per SSTable)
         for sstable in sstables_snapshot:
             results = await sstable.get_range(k1, k2)
             sources.append(iter(results))

@@ -100,6 +100,21 @@ class EngineInitializer:
         match = re.search(r"(\d+)\.sst", last_file)
         return int(match.group(1)) if match else 0
 
+    def _cleanup_temp_files(self) -> None:
+        """
+        Remove orphaned .tmp files from interrupted SSTable flushes.
+
+        These files indicate a crash during SSTable creation. The data
+        is safe in the WAL and will be re-flushed.
+        """
+        if not os.path.exists(self._sstable_dir):
+            return
+
+        for filename in os.listdir(self._sstable_dir):
+            if filename.endswith(".tmp"):
+                tmp_path = os.path.join(self._sstable_dir, filename)
+                os.remove(tmp_path)
+
     def recover(self) -> tuple[list[tuple[MemTable, WAL]], list[SSTable], int]:
         """
         Recover state from disk.
@@ -110,6 +125,9 @@ class EngineInitializer:
             - List of SSTable instances
             - Next SSTable ID to use
         """
+        # Clean up any orphaned temp files from interrupted flushes
+        self._cleanup_temp_files()
+
         # Recover MemTables from WALs
         memtables_and_wals: list[tuple[MemTable, WAL]] = []
         for wal_path in self._get_wals():
